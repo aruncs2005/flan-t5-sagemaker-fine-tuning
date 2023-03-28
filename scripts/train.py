@@ -32,17 +32,9 @@ def test_step(model, batch):
 def main():
     args = parse_args()
 
-    # Dummy load to prevent model_creation failure
-    config = AutoConfig.from_pretrained(args.model_name_or_path)
-    model = AutoModelForSeq2SeqLM.from_config(config)
+    model =  AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path,
+                                                        cache_dir="/tmp")
 
-    with smp.model_creation(
-        dtype=torch.bfloat16
-    
-        ):
-        model =  AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path,
-                                                        cache_dir="/tmp",ignore_mismatched_sizes=True)
-    
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
@@ -183,8 +175,8 @@ def main():
                 batch = {k: v.to(device) for k, v, in batch.items()}
                 loss = test_step(model, batch).reduce_mean()
             losses.append(loss)
-            # if step >= 100:
-            #     break
+            if step >= args.max_train_steps:
+                break
         try:
             eval_loss = torch.mean(torch.tensor(losses,dtype=float))
             perplexity = math.exp(eval_loss)
@@ -202,7 +194,7 @@ def main():
         user_content["buffer_names"] = get_buffer_names(model)
         user_content["param_shapes"] = get_param_shapes(model, optimizer)
      
-        smp.save_checkpoint("/opt/ml/output",
+        smp.save_checkpoint(args.model_dir,
                 tag=f"flan_t5_finetuning_1",
                 partial=True,
                 model=model,
@@ -212,13 +204,6 @@ def main():
 
         wait_for_everyone()
 
-        if is_main_process(smp.rank()):
-            full_model = get_full_state_dict_from_sharded_data_parallel_checkpoint("/opt/ml/output", tag=f"flan_t5_finetuning_1_partial", dtype=torch.float32)
-    
-      
-            torch.save(full_model, args.model_dir + "/flan_t5_11b_fine_tune.pt")
-
-            tokenizer.save_pretrained(args.model_dir)
 
 if __name__ == "__main__":
     main()
