@@ -13,7 +13,7 @@ import smdistributed.modelparallel
 import smdistributed.modelparallel.torch as smp
 from sharded_data_parallel_checkpoint import get_full_state_dict_from_sharded_data_parallel_checkpoint
 from sharded_data_parallel_checkpoint import get_buffer_names, get_param_shapes
-
+import json
 
 @smp.step
 def train_step(model, batch):
@@ -186,15 +186,14 @@ def main():
         print(f"epoch {epoch}: Eval perplexity: {perplexity} Eval loss: {eval_loss}")
 
 
-
+    wait_for_everyone()
     if args.model_dir is not None:
-        wait_for_everyone()
 
         user_content = {}
         user_content["buffer_names"] = get_buffer_names(model)
         user_content["param_shapes"] = get_param_shapes(model, optimizer)
      
-        smp.save_checkpoint(args.model_dir,
+        smp.save_checkpoint("/tmp",
                 tag=f"flan_t5_finetuning_1",
                 partial=True,
                 model=model,
@@ -202,8 +201,14 @@ def main():
                 user_content=user_content)
         print("saving the final model")
 
-        wait_for_everyone()
+    
+    if smp.rank() == 0:
+        full_model = get_full_state_dict_from_sharded_data_parallel_checkpoint("/tmp", tag=f"flan_t5_finetuning_1_partial", dtype=torch.float32)
 
+        torch.save(full_model, args.model_dir + "/model_weights.pt")
+        tokenizer.save_pretrained(args.model_dir)
+
+    wait_for_everyone()
 
 if __name__ == "__main__":
     main()
