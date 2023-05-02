@@ -11,9 +11,8 @@ from utils import parse_args,is_local_main_process,is_main_process,wait_for_ever
 import math
 import smdistributed.modelparallel
 import smdistributed.modelparallel.torch as smp
-from sharded_data_parallel_checkpoint import get_full_state_dict_from_sharded_data_parallel_checkpoint
-from sharded_data_parallel_checkpoint import get_buffer_names, get_param_shapes
-import json
+import time
+import numpy as np
 
 @smp.step
 def train_step(model, batch):
@@ -27,14 +26,32 @@ def test_step(model, batch):
     loss = model(**batch)["loss"]
     return loss
 
-
+def compute_num_params(model):
+    num_params = 0
+    seen = set()
+    for p in model.parameters():
+        if p not in seen:
+            seen.add(p)
+            if hasattr(p, "ds_shape"):
+                num_params += np.prod(p.ds_shape) 
+            else:
+                num_params += np.prod(p.size())
+    
+    return num_params 
 
 def main():
     args = parse_args()
 
-    model =  AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path,
-                                                        cache_dir="/tmp")
+    config = AutoConfig.from_pretrained(args.model_name_or_path)
+    
+    with smp.model_creation(
+        dtype=torch.bfloat16
+        ):
+        model =  AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path,
+                                                        cache_dir=f"/tmp",config=config,torch_dtype=torch.bfloat16)
+        model.config.use_cache = False
 
+    num_params = compute_num_params(model)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
@@ -125,9 +142,16 @@ def main():
 
     model = smp.DistributedModel(model, trace_device="gpu")
 
+    # enable activation checkpointing.
+    m = model.get_module()
+    for c in m.encoder.block.children():
+        smp.set_activation_checkpointing(c)
+    for c in m.decoder.block.children():
+        smp.set_activation_checkpointing(c)
+
     optimizer = smp.DistributedOptimizer(optimizer)
 
-       # Train!
+    # Train!
     total_batch_size = args.per_device_train_batch_size *smp.size() * args.gradient_accumulation_steps
 
     if is_main_process(smp.rank()):
@@ -145,6 +169,8 @@ def main():
 
     progress_bar = tqdm(range(total_steps), disable=not is_local_main_process(smp.local_rank()))
     completed_steps = 0
+    total_loss = 0
+
     for epoch in range(args.num_train_epochs):
         model.train()
         total_loss = 0
@@ -162,6 +188,8 @@ def main():
 
             progress_bar.update(1)
             completed_steps += 1
+
+
             if completed_steps >= args.max_train_steps:
                 break
 
@@ -175,8 +203,9 @@ def main():
                 batch = {k: v.to(device) for k, v, in batch.items()}
                 loss = test_step(model, batch).reduce_mean()
             losses.append(loss)
-            if step >= args.max_train_steps:
+            if step > 50:
                 break
+        
         try:
             eval_loss = torch.mean(torch.tensor(losses,dtype=float))
             perplexity = math.exp(eval_loss)
@@ -186,29 +215,20 @@ def main():
         print(f"epoch {epoch}: Eval perplexity: {perplexity} Eval loss: {eval_loss}")
 
 
-    wait_for_everyone()
-    if args.model_dir is not None:
-
-        user_content = {}
-        user_content["buffer_names"] = get_buffer_names(model)
-        user_content["param_shapes"] = get_param_shapes(model, optimizer)
-     
-        smp.save_checkpoint("/tmp",
-                tag=f"flan_t5_finetuning_1",
-                partial=True,
+  
+    smp.save_checkpoint(args.checkpoint_dir,
+                tag=f"flan_t5_weights.pt",
+                partial=False,
                 model=model,
-                optimizer=optimizer,
-                user_content=user_content)
-        print("saving the final model")
-
-    
-    if smp.rank() == 0:
-        full_model = get_full_state_dict_from_sharded_data_parallel_checkpoint("/tmp", tag=f"flan_t5_finetuning_1_partial", dtype=torch.float32)
-
-        torch.save(full_model, args.model_dir + "/model_weights.pt")
-        tokenizer.save_pretrained(args.model_dir)
+                optimizer=optimizer)
+        
+    print("saving the final model")
 
     wait_for_everyone()
+
+    if is_main_process(smp.rank()):
+        tokenizer.save_pretrained(args.checkpoint_dir)
+
 
 if __name__ == "__main__":
     main()
